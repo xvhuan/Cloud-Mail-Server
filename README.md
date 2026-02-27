@@ -20,6 +20,7 @@ git clone git@github.com:xvhuan/Cloud-Mail-Server.git
 
 - 前后端一体：后端镜像构建时自动打包 `mail-vue`
 - SMTP 直接收信：对外开放 `25`
+- SMTP 服务器直发：站外邮件由服务器直连目标 MX（需放通出站 25）
 - Web/API 服务：对外开放 `8787`
 - `PostgreSQL`、`Redis`、`MinIO` 全部走 Docker 内置网络，不占用宿主机端口
 

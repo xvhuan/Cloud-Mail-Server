@@ -7,7 +7,6 @@ import settingService from './setting-service';
 import accountService from './account-service';
 import BizError from '../error/biz-error';
 import emailUtils from '../utils/email-utils';
-import { Resend } from 'resend';
 import attService from './att-service';
 import { parseHTML } from 'linkedom';
 import userService from './user-service';
@@ -21,6 +20,8 @@ import domainUtils from '../utils/domain-uitls';
 import account from "../entity/account";
 import { att } from '../entity/att';
 import telegramService from './telegram-service';
+import r2Service from './r2-service';
+import { sendOutboundEmailDirect } from '../runtime/smtp/send-outbound-email';
 
 const emailService = {
 
@@ -163,7 +164,7 @@ const emailService = {
 			attachments //附件
 		} = params;
 
-		const { resendTokens, r2Domain, send, domainList } = await settingService.query(c);
+		const { r2Domain, send, domainList } = await settingService.query(c);
 
 		let { imageDataList, html } = await attService.toImageUrlHtml(c, content);
 
@@ -175,11 +176,15 @@ const emailService = {
 		const userRow = await userService.selectById(c, userId);
 		const roleRow = await roleService.selectById(c, userRow.type);
 
-		//判断接收方是不是全部为站内邮箱
-		const allInternal = receiveEmail.every(email => {
+		const isInternalRecipient = (email) => {
 			const domain = '@' + emailUtils.getDomain(email);
 			return domainList.includes(domain);
-		});
+		};
+
+		//判断接收方是不是全部为站内邮箱
+		const allInternal = receiveEmail.every(isInternalRecipient);
+		const internalRecipients = receiveEmail.filter(isInternalRecipient);
+		const externalRecipients = receiveEmail.filter(item => !isInternalRecipient(item));
 
 		if (c.env.admin !== userRow.email) {
 
@@ -228,14 +233,6 @@ const emailService = {
 
 		}
 
-		const domain = emailUtils.getDomain(accountRow.email);
-		const resendToken = resendTokens[domain];
-
-		//如果接收方存在站外邮箱，又没有resend token
-		if (!resendToken && !allInternal) {
-			throw new BizError(t('noResendToken'));
-		}
-
 		//没有发件人名字自动截取
 		if (!name) {
 			name = emailUtils.getName(accountRow.email);
@@ -256,38 +253,24 @@ const emailService = {
 
 		}
 
-		let resendResult = {};
-
-		//存在站外时邮箱全部由resend发送
-		if (!allInternal) {
-
-			const resend = new Resend(resendToken);
-
-			const sendForm = {
-				from: `${name} <${accountRow.email}>`,
-				to: [...receiveEmail],
-				subject: subject,
-				text: text,
-				html: html,
-				attachments: [...imageDataList, ...attachments]
-			};
-
-			if (sendType === 'reply') {
-				sendForm.headers = {
-					'in-reply-to': emailRow.messageId,
-					'references': emailRow.messageId
-				};
+		//存在站外收件时，使用服务器直连目标 MX 发送
+		if (!allInternal && externalRecipients.length > 0) {
+			try {
+				const smtpAttachments = await this.toSmtpAttachments(c, imageDataList, attachments);
+				await sendOutboundEmailDirect({
+					fromName: name,
+					fromEmail: accountRow.email,
+					to: externalRecipients,
+					subject: subject,
+					text: text,
+					html: html,
+					attachments: smtpAttachments,
+					inReplyTo: sendType === 'reply' ? emailRow.messageId : '',
+					references: sendType === 'reply' ? emailRow.messageId : ''
+				});
+			} catch (error) {
+				throw new BizError(error.message || 'SMTP send failed');
 			}
-
-			resendResult = await resend.emails.send(sendForm);
-
-		}
-
-		const { data, error } = resendResult;
-
-
-		if (error) {
-			throw new BizError(error.message);
 		}
 
 		imageDataList = imageDataList.map(item => ({...item, contentId: `<${item.contentId}>`}))
@@ -306,7 +289,7 @@ const emailService = {
 		emailData.status = emailConst.status.SENT;
 		emailData.type = emailConst.type.SEND;
 		emailData.userId = userId;
-		emailData.resendEmailId = data?.id;
+		emailData.resendEmailId = null;
 
 		const recipient = [];
 
@@ -348,9 +331,9 @@ const emailService = {
 		const attList = await attService.selectByEmailIds(c, [emailResult.emailId]);
 		emailResult.attList = attList;
 
-		//如果全是站内接收方，直接写入数据库
-		if (allInternal) {
-			await this.HandleOnSiteEmail(c, receiveEmail, emailResult, attList);
+		//站内收件人直接写入数据库（兼容“混合收件人”场景）
+		if (internalRecipients.length > 0) {
+			await this.HandleOnSiteEmail(c, internalRecipients, emailResult, attList);
 		}
 
 		const dateStr = dayjs().format('YYYY-MM-DD');
@@ -365,6 +348,54 @@ const emailService = {
 		}
 
 		return [ emailResult ];
+	},
+
+	toAttachmentBuffer(content) {
+		if (!content) return null;
+		if (Buffer.isBuffer(content)) return content;
+		if (content instanceof Uint8Array) return Buffer.from(content);
+		if (content instanceof ArrayBuffer) return Buffer.from(content);
+		if (typeof content === 'string') {
+			const base64 = content.includes(',') ? content.split(',').pop() : content;
+			return Buffer.from(base64 || '', 'base64');
+		}
+		return null;
+	},
+
+	async toSmtpAttachments(c, imageDataList = [], attachments = []) {
+		const smtpAttachments = [];
+
+		for (const image of imageDataList) {
+			let content = this.toAttachmentBuffer(image.buff || image.content);
+
+			if (!content && image.key) {
+				const obj = await r2Service.getObj(c, image.key);
+				if (obj?.body) {
+					content = this.toAttachmentBuffer(obj.body);
+				}
+			}
+
+			if (!content) continue;
+
+			smtpAttachments.push({
+				filename: image.filename || 'inline-image',
+				contentType: image.mimeType || image.contentType || 'application/octet-stream',
+				contentId: image.contentId,
+				content
+			});
+		}
+
+		for (const item of attachments || []) {
+			const content = this.toAttachmentBuffer(item.content);
+			if (!content) continue;
+			smtpAttachments.push({
+				filename: item.filename || 'attachment.bin',
+				contentType: item.contentType || item.type || 'application/octet-stream',
+				content
+			});
+		}
+
+		return smtpAttachments;
 	},
 
 	//处理站内邮件发送
