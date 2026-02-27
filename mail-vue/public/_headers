@@ -1,0 +1,6 @@
+/assets/*
+  Cache-Control: public, max-age=31556952, immutable
+/tinymce/*
+  Cache-Control: public, max-age=604800, immutable
+/image/*
+  Cache-Control: public, max-age=604800, immutable

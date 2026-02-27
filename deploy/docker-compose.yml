@@ -1,0 +1,167 @@
+name: cloud-mail
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      TZ: ${TZ}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1 || wget -q -O- http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:latest
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing local/${S3_BUCKET}
+      "
+
+  cloud-mail-server:
+    build:
+      context: ..
+      dockerfile: cloud-mail-server/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      TZ: ${TZ}
+      PORT: 8787
+      DATABASE_URL: ${DATABASE_URL}
+      PG_SSL: ${PG_SSL}
+      REDIS_URL: ${REDIS_URL}
+      DOMAIN: ${DOMAIN}
+      ADMIN: ${ADMIN}
+      JWT_SECRET: ${JWT_SECRET}
+      ORM_LOG: ${ORM_LOG}
+      ENABLE_CRON: ${ENABLE_CRON}
+      CRON_EXPR: ${CRON_EXPR}
+      CRON_TIMEZONE: ${CRON_TIMEZONE}
+      AUTO_INIT: "false"
+      INBOUND_SHARED_SECRET: ${INBOUND_SHARED_SECRET}
+      INBOUND_MAX_SKEW_SECONDS: ${INBOUND_MAX_SKEW_SECONDS}
+      LINUXDO_CLIENT_ID: ${LINUXDO_CLIENT_ID}
+      LINUXDO_CLIENT_SECRET: ${LINUXDO_CLIENT_SECRET}
+      LINUXDO_CALLBACK_URL: ${LINUXDO_CALLBACK_URL}
+      LINUXDO_SWITCH: ${LINUXDO_SWITCH}
+      SMTP_ENABLED: "true"
+      SMTP_HOST: 0.0.0.0
+      SMTP_PORT: 25
+      SMTP_REQUIRE_AUTH: ${SMTP_REQUIRE_AUTH}
+      SMTP_AUTH_USER: ${SMTP_AUTH_USER}
+      SMTP_AUTH_PASS: ${SMTP_AUTH_PASS}
+      SMTP_ENABLE_STARTTLS: ${SMTP_ENABLE_STARTTLS}
+      SMTP_TLS_KEY_PATH: ${SMTP_TLS_KEY_PATH}
+      SMTP_TLS_CERT_PATH: ${SMTP_TLS_CERT_PATH}
+      SMTP_MAX_SIZE: ${SMTP_MAX_SIZE}
+      WEB_DIST_DIR: /app/public
+    ports:
+      - "${SMTP_BIND_PORT}:25"
+      - "${API_BIND_PORT}:8787"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8787/healthz >/dev/null 2>&1 || wget -q -O- http://127.0.0.1:8787/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  cloud-mail-init:
+    image: curlimages/curl:8.12.1
+    restart: "no"
+    depends_on:
+      cloud-mail-server:
+        condition: service_healthy
+    command: >
+      sh -c "
+      until curl -fsS http://cloud-mail-server:8787/healthz >/dev/null; do sleep 2; done;
+      code=$$(curl -sS -o /tmp/init.out -w '%{http_code}' http://cloud-mail-server:8787/api/init/${JWT_SECRET} || true);
+      body=$$(tr -d '\r\n' </tmp/init.out);
+      echo \"[cloud-mail-init] code=$$code body=$$body\";
+      test \"$$code\" = \"200\" && test \"$$body\" = \"success\"
+      "
+
+  cloud-mail-configure-storage:
+    image: postgres:16-alpine
+    restart: "no"
+    depends_on:
+      cloud-mail-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    command: >
+      sh -c "
+      psql \"$${DATABASE_URL}\" -v ON_ERROR_STOP=1 -c
+      \"UPDATE setting SET
+      bucket='${S3_BUCKET}',
+      region='us-east-1',
+      endpoint='http://minio:9000',
+      s3_access_key='${MINIO_ROOT_USER}',
+      s3_secret_key='${MINIO_ROOT_PASSWORD}',
+      force_path_style=0,
+      r2_domain='/api/oss';\"
+      "
+
+  cloud-mail-refresh-cache:
+    image: curlimages/curl:8.12.1
+    restart: "no"
+    depends_on:
+      cloud-mail-configure-storage:
+        condition: service_completed_successfully
+    command: >
+      sh -c "
+      code=$$(curl -sS -o /tmp/site.out -w '%{http_code}' http://cloud-mail-server:8787/api/setting/websiteConfig || true);
+      body=$$(tr -d '\r\n' </tmp/site.out);
+      echo \"[cloud-mail-refresh-cache] code=$$code body=$$body\";
+      test \"$$code\" = \"200\"
+      "
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:

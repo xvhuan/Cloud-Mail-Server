@@ -1,0 +1,31 @@
+{
+  "name": "cloud-mail-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.js",
+    "start": "tsx src/server.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.882.0",
+    "@hono/node-server": "^1.13.7",
+    "dayjs": "^1.11.13",
+    "dotenv": "^16.4.7",
+    "drizzle-orm": "^0.42.0",
+    "hono": "^4.7.5",
+    "i18next": "^25.3.2",
+    "ioredis": "^5.4.1",
+    "linkedom": "^0.18.10",
+    "node-cron": "^4.2.1",
+    "pg": "^8.13.1",
+    "postal-mime": "^2.4.3",
+    "resend": "^6.4.1",
+    "smtp-server": "^3.14.0",
+    "ua-parser-js": "^2.0.3",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0"
+  }
+}
