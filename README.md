@@ -1,10 +1,6 @@
 # Cloud Mail 服务器版
 
-纯服务器部署版本（无 Cloudflare 收信依赖），可直接作为一个独立仓库上传 GitHub。
-
-## 仓库地址
-
-- GitHub: `https://github.com/xvhuan/Cloud-Mail-Server`
+纯服务器部署版本（无 Cloudflare 收信依赖）
 
 ## Clone
 
